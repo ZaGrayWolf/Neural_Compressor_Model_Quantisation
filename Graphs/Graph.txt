@@ -1,3 +1,0 @@
-df = pd.read_csv('/Users/abhudaysingh/Downloads/ICASSP metrics/Sheet7-Table 1.csv')
-
-CSV_FILE_PATH = '/Users/abhudaysingh/Downloads/ICASSP metrics/Sheet7-Table 1.csv' # Make sure this CSV is in the same directory
