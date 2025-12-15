@@ -2,9 +2,9 @@
 """
 ENet (Efficient Neural Network) ONNX/INT8 Quantisation & Benchmark Pipeline
 This script integrates the ENet model with the comprehensive profiling and 
-quantization pipeline, including a fix for the NameError in activation memory calculation.
+quantization pipeline.
 """
-#NEW VERSION
+# FIXED VERSION
 
 import os
 import time
@@ -349,7 +349,8 @@ def get_model_size_mb(path):
         return os.path.getsize(path) / (1024**2)
     return 0.0
 
-class RandomCalibrationDataReader(onnxruntime.quantization.CalibrationDataReader if ORT_QUANT_AVAILABLE else object):
+# FIX: Use 'CalibrationDataReader' directly since it's already imported
+class RandomCalibrationDataReader(CalibrationDataReader if ORT_QUANT_AVAILABLE else object):
     def __init__(self, input_name, input_shape, num_samples=32):
         self.input_name = input_name
         self.input_shape = input_shape
@@ -463,7 +464,7 @@ def run_onnxruntime(onnx_path, input_name, input_shape, warmup=10, runs=100):
 
 
 def print_analysis_table(input_size_str, flops_g, params_m, total_act_mb_fp32, peak_act_mb_fp32, lat_fp32,
-                         total_act_mb_int8, peak_act_mb_int8, lat_int8, fp32_size_mb, int8_size_mb):
+                          total_act_mb_int8, peak_act_mb_int8, lat_int8, fp32_size_mb, int8_size_mb):
     header = (" Input Size | FLOPs (G) | Params (M) | Total Act FP32 (MB) | Peak Act FP32 (MB) | Latency FP32 (ms) | "
               "Total Act INT8 (MB) | Peak Act INT8 (MB) | Latency INT8 (ms) | FP32 Size (MB) | INT8 Size (MB)")
     print(header)
