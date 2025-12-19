@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-SegNet Quantization Benchmark Script
-Compatible with Intel Neural Compressor (INC).
+SegNet Quantization Benchmark Script (Fixed)
+Fixes: Replaces MaxUnpool2d with Interpolate to remove tuple outputs,
+       fixing the 'tuple object has no attribute numel' crash in INC.
 """
 
 import os
@@ -35,7 +36,7 @@ except ImportError:
     pass
 
 # ------------------------------------------------------------------------------
-# 2. Model Definition (SegNet)
+# 2. Model Definition (SegNet - Quantization Friendly)
 # ------------------------------------------------------------------------------
 
 class SegNet(nn.Module):
@@ -74,7 +75,7 @@ class SegNet(nn.Module):
         self.conv5_3 = nn.Conv2d(512, 512, kernel_size, padding=1)
         self.bn5_3 = nn.BatchNorm2d(512)
         
-        # Decoder blocks (symmetric to encoder)
+        # Decoder blocks
         self.conv5_3_D = nn.Conv2d(512, 512, kernel_size, padding=1)
         self.bn5_3_D = nn.BatchNorm2d(512)
         self.conv5_2_D = nn.Conv2d(512, 512, kernel_size, padding=1)
@@ -104,87 +105,70 @@ class SegNet(nn.Module):
         self.conv1_2_D = nn.Conv2d(64, 64, kernel_size, padding=1)
         self.bn1_2_D = nn.BatchNorm2d(64)
         
-        # Final classification layer
         self.classifier = nn.Conv2d(64, n_labels, 1)
         
-        # Pooling/Unpooling layers
-        self.pool = nn.MaxPool2d(2, 2, return_indices=True)
-        self.unpool = nn.MaxUnpool2d(2, 2)
+        # FIX: return_indices=False to return a Tensor, not a tuple
+        self.pool = nn.MaxPool2d(2, 2, return_indices=False)
     
     def forward(self, x):
-        # Store sizes for unpooling
-        sizes = []
-        indices = []
-        
-        # Encoder Block 1
+        # Encoder
         x = F.relu(self.bn1_1(self.conv1_1(x)))
         x = F.relu(self.bn1_2(self.conv1_2(x)))
-        sizes.append(x.size())
-        x, idx = self.pool(x)
-        indices.append(idx)
+        size1 = x.size()
+        x = self.pool(x) # Returns just tensor
         
-        # Encoder Block 2
         x = F.relu(self.bn2_1(self.conv2_1(x)))
         x = F.relu(self.bn2_2(self.conv2_2(x)))
-        sizes.append(x.size())
-        x, idx = self.pool(x)
-        indices.append(idx)
+        size2 = x.size()
+        x = self.pool(x)
         
-        # Encoder Block 3
         x = F.relu(self.bn3_1(self.conv3_1(x)))
         x = F.relu(self.bn3_2(self.conv3_2(x)))
         x = F.relu(self.bn3_3(self.conv3_3(x)))
-        sizes.append(x.size())
-        x, idx = self.pool(x)
-        indices.append(idx)
+        size3 = x.size()
+        x = self.pool(x)
         
-        # Encoder Block 4
         x = F.relu(self.bn4_1(self.conv4_1(x)))
         x = F.relu(self.bn4_2(self.conv4_2(x)))
         x = F.relu(self.bn4_3(self.conv4_3(x)))
-        sizes.append(x.size())
-        x, idx = self.pool(x)
-        indices.append(idx)
+        size4 = x.size()
+        x = self.pool(x)
         
-        # Encoder Block 5
         x = F.relu(self.bn5_1(self.conv5_1(x)))
         x = F.relu(self.bn5_2(self.conv5_2(x)))
         x = F.relu(self.bn5_3(self.conv5_3(x)))
-        sizes.append(x.size())
-        x, idx = self.pool(x)
-        indices.append(idx)
+        size5 = x.size()
+        x = self.pool(x)
         
-        # Decoder - reverse order
-        # Decoder Block 5
-        x = self.unpool(x, indices[4], output_size=sizes[4])
+        # Decoder - Replace Unpool with Interpolate (Nearest)
+        # Block 5
+        x = F.interpolate(x, size=size5[2:], mode='nearest')
         x = F.relu(self.bn5_3_D(self.conv5_3_D(x)))
         x = F.relu(self.bn5_2_D(self.conv5_2_D(x)))
         x = F.relu(self.bn5_1_D(self.conv5_1_D(x)))
         
-        # Decoder Block 4
-        x = self.unpool(x, indices[3], output_size=sizes[3])
+        # Block 4
+        x = F.interpolate(x, size=size4[2:], mode='nearest')
         x = F.relu(self.bn4_3_D(self.conv4_3_D(x)))
         x = F.relu(self.bn4_2_D(self.conv4_2_D(x)))
         x = F.relu(self.bn4_1_D(self.conv4_1_D(x)))
         
-        # Decoder Block 3
-        x = self.unpool(x, indices[2], output_size=sizes[2])
+        # Block 3
+        x = F.interpolate(x, size=size3[2:], mode='nearest')
         x = F.relu(self.bn3_3_D(self.conv3_3_D(x)))
         x = F.relu(self.bn3_2_D(self.conv3_2_D(x)))
         x = F.relu(self.bn3_1_D(self.conv3_1_D(x)))
         
-        # Decoder Block 2
-        x = self.unpool(x, indices[1], output_size=sizes[1])
+        # Block 2
+        x = F.interpolate(x, size=size2[2:], mode='nearest')
         x = F.relu(self.bn2_2_D(self.conv2_2_D(x)))
         x = F.relu(self.bn2_1_D(self.conv2_1_D(x)))
         
-        # Decoder Block 1
-        x = self.unpool(x, indices[0], output_size=sizes[0])
+        # Block 1
+        x = F.interpolate(x, size=size1[2:], mode='nearest')
         x = F.relu(self.bn1_2_D(self.conv1_2_D(x)))
         
-        # Final classification
         x = self.classifier(x)
-        
         return x
 
 # ------------------------------------------------------------------------------
@@ -250,7 +234,7 @@ if __name__=='__main__':
     benchmark_results = []
     
     print("\n" + "="*80)
-    print("SEGNET MULTI-RESOLUTION BENCHMARK")
+    print("SEGNET MULTI-RESOLUTION BENCHMARK (TENSOR-ONLY)")
     print("="*80)
 
     for i, shape in enumerate(input_list):
@@ -260,7 +244,6 @@ if __name__=='__main__':
         
         print(f"\nProcessing Resolution {i+1}/{len(input_list)}: {res_label} (Tensor: {tensor_shape})")
         
-        # OOM warning
         if w * h > 1920 * 1080:
              print("  [Warning] Very high resolution. Memory usage will be high.")
 
@@ -285,11 +268,12 @@ if __name__=='__main__':
             calib_dataloader = DataLoader(calib_dataset, batch_size=BATCH_SIZE)
             set_random_seed(42)
             
+            # Static quantization is safe now because inputs/outputs are pure Tensors
             config = PostTrainingQuantConfig(
                 approach="static",
                 calibration_sampling_size=5,
                 reduce_range=True,
-                example_inputs=dummy_input # Critical for MaxUnpool2d shape tracking
+                example_inputs=dummy_input 
             )
             
             try:
@@ -324,7 +308,7 @@ if __name__=='__main__':
         gc.collect()
 
     # -- Print Final Table --
-    print("\n\nSUMMARY - SEGNET")
+    print("\n\nSUMMARY - SEGNET (FIXED)")
     print("="*105)
     w_size = 20
     w_fp32 = 25
