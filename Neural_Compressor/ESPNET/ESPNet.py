@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-ESPNet Quantization Benchmark Script
-Compatible with Intel Neural Compressor (INC).
+ESPNet Quantization Benchmark Script (Final Fix)
+Fixes: 
+1. Switches to 'relu' by default to avoid PReLU 1D weight quantization crash.
+2. Maintains robust ESPModule logic for correct graph tracing.
 """
 
 import os
@@ -35,37 +37,42 @@ except ImportError:
     pass
 
 # ------------------------------------------------------------------------------
-# 2. Model Definition (ESPNet)
+# 2. Model Definition (ESPNet - Quantization Friendly)
 # ------------------------------------------------------------------------------
 
 def conv1x1(in_c, out_c, stride=1):
     return nn.Conv2d(in_c, out_c, 1, stride, bias=False)
 
-class Activation(nn.Module):
-    def __init__(self, act_type='prelu'):
-        super().__init__()
-        self.act = nn.PReLU() if act_type == 'prelu' else nn.ReLU(inplace=True)
-    def forward(self, x): return self.act(x)
-
 class ConvBNAct(nn.Sequential):
-    def __init__(self, in_c, out_c, k, s=1, d=1, act_type='prelu'):
+    def __init__(self, in_c, out_c, k, s=1, d=1, act_type='relu'):
         padding = d * (k - 1) // 2
-        super().__init__(
+        layers = [
             nn.Conv2d(in_c, out_c, k, s, padding, dilation=d, bias=False),
-            nn.BatchNorm2d(out_c),
-            Activation(act_type)
-        )
+            nn.BatchNorm2d(out_c)
+        ]
+        # Use ReLU to prevent PReLU weight quantization crash in INC/FX
+        if act_type == 'prelu':
+            layers.append(nn.PReLU(out_c))
+        else:
+            layers.append(nn.ReLU(inplace=True))
+            
+        super().__init__(*layers)
 
 class DeConvBNAct(nn.Sequential):
-    def __init__(self, in_c, out_c, act_type='prelu'):
-        super().__init__(
+    def __init__(self, in_c, out_c, act_type='relu'):
+        layers = [
             nn.ConvTranspose2d(in_c, out_c, 3, 2, 1, 1, bias=False),
-            nn.BatchNorm2d(out_c),
-            Activation(act_type)
-        )
+            nn.BatchNorm2d(out_c)
+        ]
+        if act_type == 'prelu':
+            layers.append(nn.PReLU(out_c))
+        else:
+            layers.append(nn.ReLU(inplace=True))
+            
+        super().__init__(*layers)
 
 class ESPModule(nn.Module):
-    def __init__(self, in_c, out_c, K=5, ks=3, stride=1, act_type='prelu'):
+    def __init__(self, in_c, out_c, K=5, ks=3, stride=1, act_type='relu'):
         super().__init__()
         self.K = K
         self.use_skip = in_c == out_c and stride == 1
@@ -85,21 +92,37 @@ class ESPModule(nn.Module):
             self.layers.append(ConvBNAct(ch, ch, ks, 1, 2**i, act_type))
 
     def forward(self, x):
-        res = x if self.use_skip else None
+        # Explicit graph construction to support FX Tracing
+        outs = []
+        
         if self.is_perfect:
             x_r = self.reduce(x)
-            feats = [layer(x_r) for layer in self.layers]
-            # Accumulate features
-            for i in range(1, len(feats)): 
-                feats[i] = feats[i] + feats[i-1]
+            # Branch 0
+            curr = self.layers[0](x_r)
+            outs.append(curr)
+            # Branches 1..K
+            for i in range(1, self.K):
+                curr = self.layers[i](x_r) + curr
+                outs.append(curr)
         else:
-            x_r1 = self.reduce[0](x); x_rn = self.reduce[1](x)
-            feats = [self.layers[0](x_r1)] + [layer(x_rn) for layer in self.layers[1:]]
-            for i in range(2, len(feats)): 
-                feats[i] = feats[i] + feats[i-1]
+            x_r1 = self.reduce[0](x)
+            x_rn = self.reduce[1](x)
+            
+            # Branch 0 (different width)
+            outs.append(self.layers[0](x_r1))
+            
+            # Branch 1 (start accumulation)
+            curr = self.layers[1](x_rn)
+            outs.append(curr)
+            
+            # Branches 2..K (accumulate)
+            for i in range(2, self.K):
+                curr = self.layers[i](x_rn) + curr
+                outs.append(curr)
 
-        out = torch.cat(feats, 1)
-        if res is not None: out = out + res
+        out = torch.cat(outs, 1)
+        if self.use_skip:
+            out = out + x
         return out
 
 class L2Block(nn.Module):
@@ -112,9 +135,13 @@ class L2Block(nn.Module):
                                       for _ in range(alpha)])
 
     def forward(self, x, x_input=None):
-        x = self.down(x); skip = x if self.use_skip else None
+        x = self.down(x)
+        skip = x 
         x = self.layers(x)
-        if self.use_skip: x = torch.cat([x, skip], 1)
+        
+        if self.use_skip: 
+            x = torch.cat([x, skip], 1)
+            
         if self.reinforce and x_input is not None:
             size = x.shape[2:]
             q = F.interpolate(x_input, size, mode='bilinear', align_corners=False)
@@ -134,13 +161,15 @@ class L3Block(nn.Module):
                          if use_decoder else conv1x1(out_ch, out_c))
 
     def forward(self, x):
-        x = self.down(x); skip = x if self.use_skip else None
+        x = self.down(x)
+        skip = x
         x = self.layers(x)
-        if self.use_skip: x = torch.cat([x, skip], 1)
+        if self.use_skip: 
+            x = torch.cat([x, skip], 1)
         return self.out_conv(x)
 
 class Decoder(nn.Module):
-    def __init__(self, num_class, l1_c, l2_c, act_type='prelu'):
+    def __init__(self, num_class, l1_c, l2_c, act_type='relu'):
         super().__init__()
         self.up3 = DeConvBNAct(num_class, num_class, act_type)
         self.cat2 = ConvBNAct(l2_c, num_class, 1, act_type=act_type)
@@ -151,18 +180,21 @@ class Decoder(nn.Module):
         self.up1 = DeConvBNAct(num_class, num_class, act_type)
 
     def forward(self, x, x_l1, x_l2):
-        x = self.up3(x); x_l2 = self.cat2(x_l2)
-        x = torch.cat([x, x_l2], 1); x = self.conv2(x)
-        x = self.up2(x); x_l1 = self.cat1(x_l1)
-        x = torch.cat([x, x_l1], 1); x = self.conv1(x)
+        x = self.up3(x)
+        x_l2 = self.cat2(x_l2)
+        x = torch.cat([x, x_l2], 1)
+        x = self.conv2(x)
+        x = self.up2(x)
+        x_l1 = self.cat1(x_l1)
+        x = torch.cat([x, x_l1], 1)
+        x = self.conv1(x)
         return self.up1(x)
 
 class ESPNet(nn.Module):
     def __init__(self, num_class=1, n_channel=3, arch_type='espnet',
                  K=5, alpha2=2, alpha3=8, block_ch=[16,64,128],
-                 act_type='prelu'):
+                 act_type='relu'): # Default changed to ReLU
         super().__init__()
-        # Modified to remove ActivationTrackerMixin for cleaner quantization
         types = ['espnet','espnet-a','espnet-b','espnet-c']
         if arch_type not in types: raise ValueError("Unsupported arch")
         self.arch_type = arch_type
@@ -185,22 +217,20 @@ class ESPNet(nn.Module):
         inp = x
         x = self.l1(x)
 
-        # L2 (with optional reinforcement)
-        x_l1_for_decoder = None
+        # L2
+        x_l1_for_dec = None
         if self.l2.reinforce:
             size = x.shape[2:]
             q = F.interpolate(inp, size, mode='bilinear', align_corners=False)
             x_cat = torch.cat([x, q], 1)
-            x_l1_for_decoder = x_cat 
+            x_l1_for_dec = x_cat 
             x = self.l2(x_cat, inp)
         else:
             x = self.l2(x)
 
-        x_l2_for_decoder = None
-        if self.dec:
-            x_l2_for_decoder = x 
+        x_l2_for_dec = x 
 
-        # L3 (with optional reinforcement)
+        # L3
         if self.l3.reinforce:
              size = x.shape[2:]
              q = F.interpolate(inp, size, mode='bilinear', align_corners=False)
@@ -208,9 +238,9 @@ class ESPNet(nn.Module):
 
         x = self.l3(x)
 
-        # Decoder or final upsample
-        if self.dec:
-            x = self.dec(x, x_l1_for_decoder, x_l2_for_decoder)
+        # Decoder
+        if self.dec is not None:
+            x = self.dec(x, x_l1_for_dec, x_l2_for_dec)
         else:
             x = F.interpolate(x, inp.shape[2:], mode='bilinear', align_corners=True)
         return x
@@ -235,13 +265,13 @@ def measure_latency(model, input_tensor, model_name="Model", verbose=True):
     
     try:
         with torch.no_grad():
-            for _ in range(5): 
+            for _ in range(3): 
                 model(input_tensor)
     except Exception as e:
         if verbose: print(f"Warmup failed: {e}")
         return 0.0
 
-    num_runs = 20 
+    num_runs = 15
     times = []
     with torch.no_grad():
         for _ in range(num_runs):
@@ -273,12 +303,12 @@ if __name__=='__main__':
         (3, 2560, 1440), (3, 3840, 2160)
     ]
     
-    NUM_CLASSES = 21 # Matching standard segmentation tasks
+    NUM_CLASSES = 21
     BATCH_SIZE = 1
     benchmark_results = []
     
     print("\n" + "="*80)
-    print("ESPNET MULTI-RESOLUTION BENCHMARK")
+    print("ESPNET MULTI-RESOLUTION BENCHMARK (RELU)")
     print("="*80)
 
     for i, shape in enumerate(input_list):
@@ -293,8 +323,8 @@ if __name__=='__main__':
 
         dummy_input = torch.randn(BATCH_SIZE, *tensor_shape)
         
-        # 1. Setup FP32
-        model_fp32 = ESPNet(num_class=NUM_CLASSES, arch_type='espnet').eval().cpu()
+        # 1. Setup FP32 (Use ReLU instead of PReLU for quantization stability)
+        model_fp32 = ESPNet(num_class=NUM_CLASSES, arch_type='espnet', act_type='relu').eval().cpu()
         
         # 2. Measure FP32 Latency
         print("  -> Measuring FP32 Latency...")
@@ -312,14 +342,16 @@ if __name__=='__main__':
             calib_dataloader = DataLoader(calib_dataset, batch_size=BATCH_SIZE)
             set_random_seed(42)
             
+            # Static quantization
             config = PostTrainingQuantConfig(
                 approach="static",
                 calibration_sampling_size=5,
                 reduce_range=True,
-                example_inputs=dummy_input # Critical for tracing branching logic
+                example_inputs=dummy_input 
             )
             
             try:
+                # Suppress INC logs
                 quantized_model = fit(
                     model=model_fp32,
                     conf=config,
